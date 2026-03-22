@@ -1,15 +1,16 @@
 use gpui::RenderImage;
-use hayro::{Pixmap, RenderSettings, render};
+use hayro::vello_cpu::Pixmap;
+use hayro::{RenderSettings, render};
 use hayro_interpret::font::Glyph;
 use hayro_interpret::{
-    ClipPath, Context, Device, FillRule, GlyphDrawMode, Image, InterpreterSettings, Paint,
-    PathDrawMode, SoftMask, interpret,
+    BlendMode, ClipPath, Context, Device, FillRule, GlyphDrawMode, Image, InterpreterSettings,
+    PageExt, Paint, PathDrawMode, RectExt, SoftMask, interpret,
 };
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::{Object, Rect};
+use hayro_syntax::object::Object;
 use hayro_syntax::page::Page;
 use image::{Frame, RgbaImage};
-use kurbo::{Affine, BezPath, Point, Shape};
+use kurbo::{Affine, BezPath, Point, Rect, Shape};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::fmt;
@@ -40,12 +41,12 @@ pub fn pixmap_to_gpui_image(pixmap: Pixmap) -> RenderImage {
 
     let width = u32::from(pixmap.width());
     let height = u32::from(pixmap.height());
-    let mut data = pixmap.take_u8();
-
     // Convert from RGBA to BGRA.
-    for pixel in data.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
+    let data: Vec<u8> = pixmap
+        .take()
+        .into_iter()
+        .flat_map(|rgba| [rgba.b, rgba.g, rgba.r, rgba.a])
+        .collect();
 
     let image_data = RgbaImage::from_raw(width, height, data).expect("incorrect image dimensions");
     RenderImage::new([Frame::new(image_data)])
@@ -73,7 +74,7 @@ impl fmt::Debug for PdfFeature<'_> {
                 .field(
                     "text",
                     //&String::from_utf16_lossy(&text.chunks_exact(2).map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>()),
-                    &String::from_utf8_lossy(&*text)
+                    &String::from_utf8_lossy(&text),
                 )
                 .field("rect", rect)
                 .finish(),
@@ -115,8 +116,10 @@ pub fn extract_features(
     };
     let mut device = FeatureExtractor { shared: &shared };
 
+    let mut clip_path = page.intersected_crop_box().to_kurbo().to_path(0.1);
+    clip_path.apply_affine(initial_transform);
     device.push_clip_path(&ClipPath {
-        path: initial_transform * page.intersected_crop_box().to_path(0.1),
+        path: clip_path,
         fill: FillRule::NonZero,
     });
 
@@ -136,21 +139,21 @@ pub fn extract_features(
                         data.push(b'\n');
                     }
                     TypedInstruction::ShowText(text) => {
-                        data.extend_from_slice(&*text.0.get());
+                        data.extend_from_slice(&text.0.get());
                     }
                     TypedInstruction::NextLineAndShowText(text) => {
                         data.push(b'\n');
-                        data.extend_from_slice(&*text.0.get());
+                        data.extend_from_slice(&text.0.get());
                     }
                     TypedInstruction::ShowTextWithParameters(text) => {
                         data.push(b'\n');
-                        data.extend_from_slice(&*text.2.get());
+                        data.extend_from_slice(&text.2.get());
                     }
                     TypedInstruction::ShowTexts(texts) => {
                         for obj in texts.0.iter::<Object>() {
                             if let Some(_adjustment) = obj.clone().into_f32() {
                             } else if let Some(text) = obj.into_string() {
-                                data.extend_from_slice(&*text.get());
+                                data.extend_from_slice(&text.get());
                             }
                         }
                     }
@@ -203,7 +206,13 @@ impl<'a, 'out, 'pdf> Device<'a> for FeatureExtractor<'out, 'pdf> {
 
     fn push_clip_path(&mut self, _clip_path: &ClipPath) {}
 
-    fn push_transparency_group(&mut self, _opacity: f32, _mask: Option<SoftMask<'a>>) {}
+    fn push_transparency_group(
+        &mut self,
+        _opacity: f32,
+        _mask: Option<SoftMask<'a>>,
+        _blend_mode: BlendMode,
+    ) {
+    }
 
     fn draw_glyph(
         &mut self,
@@ -236,4 +245,6 @@ impl<'a, 'out, 'pdf> Device<'a> for FeatureExtractor<'out, 'pdf> {
     fn pop_clip_path(&mut self) {}
 
     fn pop_transparency_group(&mut self) {}
+
+    fn set_blend_mode(&mut self, _blend_mode: hayro_interpret::BlendMode) {}
 }

@@ -1,0 +1,77 @@
+name: Deploy GitHub Pages
+
+on:
+  workflow_dispatch: # allow manual trigger
+  push:
+    tags: ['v*'] # otherwise rebuild when releasing a new version
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # https://github.com/dtolnay/rust-toolchain
+    - name: Setup Rust with WebAssembly target
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+        targets: wasm32-unknown-unknown
+
+    - name: Rust Cache # cache the rust build artefacts
+      uses: Swatinem/rust-cache@v2
+
+    # https://crates.io/crates/cargo-binstall/1.12.3#user-content-in-github-actions
+    - name: Install cargo-binstall
+      uses: cargo-bins/cargo-binstall@main
+
+    # https://trunkrs.dev/guide/getting-started/installation.html#using-cargo-binstall
+    - name: Install the Trunk CLI (using binstall)
+      run: cargo binstall trunk
+
+    - name: Release Build (using Trunk)
+      # Environment $public_url resolves to the github project page.
+      # If using a user/organization page, remove the `${{ github.event.repository.name }}` part.
+      # using --public-url something will allow trunk to modify all the href paths like from favicon.ico to repo_name/favicon.ico .
+      # this is necessary for github pages where the site is deployed to username.github.io/repo_name and all files must be requested
+      # relatively as project_name/favicon.ico. if we skip public-url option, the href paths will instead request username.github.io/favicon.ico which
+      # will obviously return error 404 not found.
+      run: cd trunk && trunk build --release --public-url $public_url
+      env:
+        public_url: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+
+    #- name: Move files into subfolder
+    #  # https://stackoverflow.com/questions/59954185/github-actions-split-long-command-into-multiple-lines
+    #  run: |
+    #    mkdir github-page
+    #    mv dist github-page/app
+
+    #- name: Add redirect
+    #  run: echo '<meta http-equiv="refresh" content="0;url=app/index.html">' > github-page/index.html
+
+    # https://github.com/actions/upload-pages-artifact
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: trunk/dist/
+
+  # https://github.com/actions/deploy-pages
+  deploy:
+    name: Deploy
+    permissions:
+      contents: read
+      pages: write      # to deploy to Pages
+      id-token: write   # to verify the deployment originates from an appropriate source
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: windows-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

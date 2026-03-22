@@ -1,32 +1,48 @@
+#[cfg(target_family = "wasm")]
+extern crate gpui_component_assets_git as gpui_component_assets;
+#[cfg(target_family = "wasm")]
+extern crate gpui_component_git as gpui_component;
+#[cfg(target_family = "wasm")]
+extern crate gpui_git as gpui;
+#[cfg(target_family = "wasm")]
+extern crate gpui_platform_git as gpui_platform;
+
+#[cfg(not(target_family = "wasm"))]
 pub mod assets;
 pub mod elm;
 pub mod pdf;
 pub mod prompt;
 pub mod tabs;
 
-use crate::assets::Assets;
 use crate::elm::{MsgSender, Update};
 use crate::prompt::{NoDisplayHandle, prompt_load_pdf_file};
 use crate::tabs::TabsView;
 use gpui::{
-    App, AppContext, Application, AsyncWindowContext, Context, Entity, FocusHandle,
-    ImageCacheError, ImageSource, InteractiveElement, IntoElement, KeyBinding, ObjectFit,
-    ParentElement, Pixels, Render, RenderImage, Resource, ScrollHandle, SharedString, Size, Styled,
-    StyledImage, Task, WeakEntity, Window, WindowOptions, div, img, px, size,
+    App, AppContext, AsyncWindowContext, Context, Entity, FocusHandle, ImageCacheError,
+    ImageSource, InteractiveElement, IntoElement, KeyBinding, ObjectFit, ParentElement, Pixels,
+    Render, RenderImage, Resource, ScrollHandle, SharedString, Size, Styled, StyledImage, Task,
+    WeakEntity, Window, WindowOptions, div, img, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
+use gpui_component::scroll::Scrollbar;
 use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
-use hayro::{InterpreterSettings, Pdf, RenderSettings};
+use hayro::RenderSettings;
+use hayro_interpret::InterpreterSettings;
+use hayro_syntax::Pdf;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(not(target_family = "wasm"))]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 use std::time::Duration;
+#[cfg(target_family = "wasm")]
+use wasm_bindgen::prelude::*;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -73,6 +89,7 @@ impl From<RenderSettings2> for RenderSettings {
             y_scale: value.y_scale,
             width: value.width,
             height: value.height,
+            bg_color: hayro::vello_cpu::color::palette::css::WHITE,
         }
     }
 }
@@ -99,7 +116,7 @@ pub fn range_intersection(a: Range<usize>, b: Range<usize>) -> Range<usize> {
 pub struct PdfTabData {
     path: Arc<PathBuf>,
     pdf_data: Arc<Vec<u8>>,
-    scroll: Arc<Mutex<VirtualListScrollHandle>>,
+    scroll: RefCell<VirtualListScrollHandle>,
 }
 impl tabs::TabData for PdfTabData {
     fn label(&self) -> SharedString {
@@ -140,6 +157,72 @@ impl<T> PartialEq for ArcIdentity<T> {
 }
 impl<T> Eq for ArcIdentity<T> {}
 
+#[cfg(target_family = "wasm")]
+struct AsyncCondvar {
+    waker: Mutex<Option<std::task::Waker>>,
+}
+#[cfg(target_family = "wasm")]
+impl AsyncCondvar {
+    pub const fn new() -> Self {
+        Self {
+            waker: Mutex::new(None),
+        }
+    }
+    pub fn wait(&self) -> impl Future<Output = ()> {
+        struct WaitFut<'a>(&'a AsyncCondvar, bool);
+        impl std::future::Future for WaitFut<'_> {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+                let this = self.get_mut();
+                if this.1 {
+                    return Poll::Ready(());
+                }
+                this.1 = true;
+                let prev = this.0.waker.lock().unwrap().replace(cx.waker().clone());
+                if let Some(prev) = prev {
+                    prev.wake();
+                }
+                Poll::Pending
+            }
+        }
+        WaitFut(self, false)
+    }
+    pub fn notify_all(&self) {
+        let mut guard = self.waker.lock().unwrap();
+        if let Some(waker) = guard.take() {
+            waker.wake();
+        }
+    }
+}
+
+macro_rules! async_on_wasm {
+    ($($code:tt)*) => {{
+        #[cfg(target_family = "wasm")]
+        {
+            async move {
+                $($code)*
+            }
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            $($code)*
+        }
+    }};
+}
+#[cfg(not(target_family = "wasm"))]
+macro_rules! future_on_wasm {
+    ($ret_ty:ty) => {
+        $ret_ty
+    };
+}
+#[cfg(target_family = "wasm")]
+macro_rules! future_on_wasm {
+    ($ret_ty:ty) => {
+        impl Future<Output = $ret_ty>
+    };
+}
+
 struct PdfPageCacheMutableState {
     /// Currently cached images of PDF pages. Index of an image is the PDF page's index.
     images: Vec<Option<Arc<RenderImage>>>,
@@ -171,7 +254,10 @@ impl PdfPageCacheMutableState {
 }
 struct PdfPageCacheSharedState {
     state: Mutex<PdfPageCacheMutableState>,
+    #[cfg(not(target_family = "wasm"))]
     wake_worker: Condvar,
+    #[cfg(target_family = "wasm")]
+    wake_worker: AsyncCondvar,
 }
 struct PdfPageCache {
     /// Data shared between background worker thread, frontend async task and [`PdfPages`] view.
@@ -212,7 +298,10 @@ impl PdfPageCache {
                 acknowledged_pages: 0..0,
                 should_quit: false,
             }),
+            #[cfg(not(target_family = "wasm"))]
             wake_worker: Condvar::new(),
+            #[cfg(target_family = "wasm")]
+            wake_worker: AsyncCondvar::new(),
         });
         let this = Self {
             shared: shared.clone(),
@@ -224,10 +313,19 @@ impl PdfPageCache {
             pages_last_frame: 0..0,
             rendered_images: Default::default(),
         };
-        std::thread::Builder::new()
-            .name("PDF Rasterizer".to_owned())
-            .spawn(move || Self::background_work(shared))
-            .expect("failed to spawn background worker thread");
+
+        #[cfg(target_family = "wasm")]
+        {
+            cx.background_spawn(async move { Self::background_work(shared).await })
+                .detach();
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            std::thread::Builder::new()
+                .name("PDF Rasterizer".to_owned())
+                .spawn(move || Self::background_work(shared))
+                .expect("failed to spawn background worker thread");
+        }
 
         this
     }
@@ -274,7 +372,7 @@ impl PdfPageCache {
         let mut rendered_images = Vec::with_capacity(256);
         loop {
             let should_quit = WaitForChange {
-                shared: &*shared,
+                shared: &shared,
                 rendered_images: &mut rendered_images,
             }
             .await;
@@ -295,98 +393,138 @@ impl PdfPageCache {
 
     /// Executed by dedicated worker thread that will rasterize PDF pages as requested by the
     /// [`Self::get_images`] method.
-    fn background_work(shared: Arc<PdfPageCacheSharedState>) {
-        let mut guard = shared.state.lock().unwrap();
-        loop {
-            // Check if we need to rasterize another page:
-            let mut index_to_render = None;
-            {
-                let mut wanted_pages = guard.requested_pages.clone();
-
-                // more aggressively cache earlier pages since the virtual list doesn't:
-                wanted_pages.start = wanted_pages.start.saturating_sub(1);
-
-                // Chose the page closest to the center of the requested range:
-                let mut chose_index_distance = usize::MAX;
-                let center = wanted_pages.end.saturating_sub(1 + wanted_pages.len() / 2);
-
-                // We special case caching of the first page since the virtual list always requests it
-                let cache_first_image = guard.requested_pages.start <= 1;
-
-                for (index, image) in guard.images.iter_mut().enumerate() {
-                    let should_cache = if index == 0 {
-                        cache_first_image
-                    } else {
-                        wanted_pages.contains(&index)
-                    };
-                    if !should_cache {
-                        *image = None;
-                    } else if image.is_none() {
-                        let distance = index.abs_diff(center);
-                        if distance < chose_index_distance {
-                            index_to_render = Some(index);
-                            chose_index_distance = distance;
+    fn background_work(shared: Arc<PdfPageCacheSharedState>) -> future_on_wasm!(()) {
+        async_on_wasm!({
+            #[cfg_attr(not(target_family = "wasm"), expect(clippy::never_loop, unused_labels))]
+            'acquire_guard: loop {
+                let _loop_result = {
+                    let mut guard = shared.state.lock().unwrap();
+                    loop {
+                        if guard.should_quit {
+                            return;
                         }
-                    }
-                }
-            }
 
-            log::debug!(
-                "Rasterize page {index_to_render:?}, acknowledged_pages={:?}, requested_pages={:?}",
-                guard.acknowledged_pages.clone(),
-                guard.requested_pages.clone()
-            );
-            guard.acknowledged_pages = guard.requested_pages.clone();
+                        // Check if we need to rasterize another page:
+                        let mut index_to_render = None;
+                        {
+                            let mut wanted_pages = guard.requested_pages.clone();
 
-            if let Some(index) = index_to_render {
-                // Copy render inputs:
-                let Some(pdf) = guard.pdf.clone() else {
-                    continue;
-                };
-                let render_settings = guard.render_settings;
+                            // more aggressively cache earlier pages since the virtual list doesn't:
+                            wanted_pages.start = wanted_pages.start.saturating_sub(1);
 
-                // render while not holding the lock:
-                drop(guard);
-                let new_image = pdf::rasterize_pdf_page(
-                    &pdf.pages()[index],
-                    &InterpreterSettings::default(),
-                    &RenderSettings::from(render_settings),
-                );
+                            // Chose the page closest to the center of the requested range:
+                            let mut chose_index_distance = usize::MAX;
+                            let center =
+                                wanted_pages.end.saturating_sub(1 + wanted_pages.len() / 2);
 
-                // re-acquire lock and save new image to shared state:
-                guard = shared.state.lock().unwrap();
-                if guard.render_settings == render_settings
-                    && guard
-                        .pdf
-                        .as_ref()
-                        .is_some_and(|new_pdf| Arc::ptr_eq(&pdf, &new_pdf))
-                {
-                    if let Some(image) = guard.images.get_mut(index) {
-                        *image = Some(new_image);
+                            // We special case caching of the first page since the virtual list always requests it
+                            let cache_first_image = guard.requested_pages.start <= 1;
+
+                            for (index, image) in guard.images.iter_mut().enumerate() {
+                                let should_cache = if index == 0 {
+                                    cache_first_image
+                                } else {
+                                    wanted_pages.contains(&index)
+                                };
+                                if !should_cache {
+                                    *image = None;
+                                } else if image.is_none() {
+                                    let distance = index.abs_diff(center);
+                                    if distance < chose_index_distance {
+                                        index_to_render = Some(index);
+                                        chose_index_distance = distance;
+                                    }
+                                }
+                            }
+                        }
+
                         log::debug!(
-                            "Rasterize image done, index={index}, acknowledged_pages={:?}, wake_frontend={}",
-                            guard.acknowledged_pages,
-                            guard.wake_future.is_some()
+                            "Rasterize page {index_to_render:?}, acknowledged_pages={:?}, requested_pages={:?}",
+                            guard.acknowledged_pages.clone(),
+                            guard.requested_pages.clone()
                         );
-                        if let Some(waker) = guard.wake_future.take() {
-                            waker.wake();
+                        guard.acknowledged_pages = guard.requested_pages.clone();
+
+                        if let Some(index) = index_to_render {
+                            // Copy render inputs:
+                            let Some(pdf) = guard.pdf.clone() else {
+                                continue;
+                            };
+                            let render_settings = guard.render_settings;
+
+                            // render while not holding the lock:
+                            drop(guard);
+                            let new_image = pdf::rasterize_pdf_page(
+                                &pdf.pages()[index],
+                                &InterpreterSettings::default(),
+                                &RenderSettings::from(render_settings),
+                            );
+
+                            // re-acquire lock and save new image to shared state:
+                            guard = shared.state.lock().unwrap();
+                            if guard.render_settings == render_settings
+                                && guard
+                                    .pdf
+                                    .as_ref()
+                                    .is_some_and(|new_pdf| Arc::ptr_eq(&pdf, new_pdf))
+                                && let Some(image) = guard.images.get_mut(index)
+                            {
+                                *image = Some(new_image);
+                                log::debug!(
+                                    "Rasterize image done, index={index}, acknowledged_pages={:?}, wake_frontend={}",
+                                    guard.acknowledged_pages,
+                                    guard.wake_future.is_some()
+                                );
+                                if let Some(waker) = guard.wake_future.take() {
+                                    waker.wake();
+                                }
+                            }
+                            continue;
+                        }
+
+                        #[cfg(not(target_family = "wasm"))]
+                        {
+                            // Nothing more to render (ensure range is correct and then wait):
+                            guard = shared
+                                .wake_worker
+                                .wait_while(guard, |state| {
+                                    !state.should_quit
+                                        && state.acknowledged_pages == state.requested_pages
+                                })
+                                .unwrap();
+                        }
+
+                        #[cfg(target_family = "wasm")]
+                        {
+                            break; // If async then need to wait while not holding mutex guard
                         }
                     }
-                }
-            } else {
-                // Nothing more to render (ensure range is correct and then wait):
-                guard = shared
-                    .wake_worker
-                    .wait_while(guard, |state| {
-                        !state.should_quit && state.acknowledged_pages == state.requested_pages
-                    })
-                    .unwrap();
-            }
+                };
 
-            if guard.should_quit {
-                return;
+                #[cfg(not(target_family = "wasm"))]
+                #[expect(unreachable_code)]
+                {
+                    match _loop_result {
+                        // Empty type, i.e. unreachable
+                    }
+                }
+
+                #[cfg(target_family = "wasm")]
+                {
+                    loop {
+                        {
+                            let guard = shared.state.lock().unwrap();
+                            if guard.should_quit
+                                || guard.acknowledged_pages != guard.requested_pages
+                            {
+                                continue 'acquire_guard;
+                            }
+                        }
+                        shared.wake_worker.wait().await;
+                    }
+                }
             }
-        }
+        })
     }
 
     pub fn clear(&self) {
@@ -437,7 +575,7 @@ impl PdfPageCache {
             return images;
         }
 
-        if self.pages_this_frame.len() == 0
+        if self.pages_this_frame.is_empty()
             || !range_is_contiguous(self.pages_this_frame.clone(), visible_range.clone())
         {
             // If non-contiguous: ignore previous range this frame, it was likely rendered
@@ -476,10 +614,8 @@ impl PdfPageCache {
 pub struct PdfPages {
     /// Current scroll position.
     scroll_handle: VirtualListScrollHandle,
-    /// State of the scrollbar element.
-    scroll_state: ScrollbarState,
     /// Pointer to scroll info inside tab data. Use to save current scroll position before loading a new PDF.
-    save_scroll: Arc<Mutex<VirtualListScrollHandle>>,
+    save_scroll: RefCell<VirtualListScrollHandle>,
     /// Sizes of each page in the PDF file.
     item_sizes: Rc<Vec<Size<Pixels>>>,
     /// Cached rasterized PDF pages.
@@ -492,10 +628,7 @@ impl PdfPages {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             scroll_handle: VirtualListScrollHandle::from(ScrollHandle::default()),
-            scroll_state: Default::default(),
-            save_scroll: Arc::new(Mutex::new(VirtualListScrollHandle::from(
-                ScrollHandle::new(),
-            ))),
+            save_scroll: RefCell::new(VirtualListScrollHandle::from(ScrollHandle::new())),
             item_sizes: Rc::new(vec![]),
             pdf_page_cache: PdfPageCache::new(window, cx),
             disabled_cache: cx.new(|_cx| NoGpuiImageCache),
@@ -511,7 +644,8 @@ impl Render for PdfPages {
         }
 
         self.pdf_page_cache.frame_start(window, cx);
-        let element = div()
+
+        div()
             .relative()
             .size_full()
             .child(
@@ -550,14 +684,9 @@ impl Render for PdfPages {
                     .left_0()
                     .right_0()
                     .bottom_0()
-                    .child(
-                        Scrollbar::both(&self.scroll_state, &self.scroll_handle)
-                            .axis(ScrollbarAxis::Vertical),
-                    ),
+                    .child(Scrollbar::vertical(&self.scroll_handle)),
             )
-            .into_any_element();
-
-        element
+            .into_any_element()
     }
 }
 
@@ -604,17 +733,17 @@ impl PdfReader {
             pages.item_sizes = Rc::new(vec![]); // forget page sizes
             pages.pdf_page_cache.clear(); // clear cache
 
-            *pages.save_scroll.lock().unwrap() = pages.scroll_handle.clone(); // save scroll
+            *pages.save_scroll.borrow_mut() = pages.scroll_handle.clone(); // save scroll
             pages.scroll_handle = VirtualListScrollHandle::from(ScrollHandle::default()); // reset scroll
 
             let Some(tab_data) = self.tabs.read(cx).active_tab_data() else {
                 return;
             };
-            pages.scroll_handle = tab_data.scroll.lock().unwrap().clone(); // restore scroll
+            pages.scroll_handle = tab_data.scroll.borrow().clone(); // restore scroll
             let Ok(pdf) = Pdf::new(tab_data.pdf_data.clone()) else {
                 return;
             };
-            let pdf = Arc::new(pdf);
+            let pdf: Arc<Pdf> = Arc::new(pdf);
             if pdf.pages().is_empty() {
                 // no pages
                 return;
@@ -744,7 +873,10 @@ impl Render for PdfReader {
                                             .spawn(async move |_window, mut sender| {
                                                 if let Some(data) = prompt.await {
                                                     sender.send(PdfCommand::LoadedData(
+                                                        #[cfg(not(target_family = "wasm"))]
                                                         data.path().to_owned(),
+                                                        #[cfg(target_family = "wasm")]
+                                                        data.file_name().into(),
                                                         data.read().await,
                                                     ))
                                                 }
@@ -771,9 +903,7 @@ impl Update<PdfCommand> for PdfReader {
                     *tab_data = Some(PdfTabData {
                         path: Arc::new(path),
                         pdf_data: Arc::new(pdf_data),
-                        scroll: Arc::new(Mutex::new(VirtualListScrollHandle::from(
-                            ScrollHandle::new(),
-                        ))),
+                        scroll: RefCell::new(VirtualListScrollHandle::from(ScrollHandle::new())),
                     });
                 }
                 self.active_pdf_changed(window, cx);
@@ -786,6 +916,7 @@ impl Update<PdfCommand> for PdfReader {
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::main)]
+#[cfg(not(target_family = "wasm"))]
 pub fn start_gui() {
     #[cfg(debug_assertions)]
     {
@@ -798,8 +929,9 @@ pub fn start_gui() {
     // let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     // let _rt_guard = rt.enter();
 
-    Application::new().with_assets(Assets).run(|cx: &mut App| {
-        cx.new(|cx: &mut Context<'_, ()>| {
+    gpui::Application::new()
+        .with_assets(crate::assets::Assets)
+        .run(|cx: &mut App| {
             // This must be called before using any GPUI Component features.
             gpui_component::init(cx);
 
@@ -817,10 +949,74 @@ pub fn start_gui() {
                     // gpui_component::Theme::change(gpui_component::ThemeMode::Light, Some(window), cx);
 
                     let main_ui = cx.new(|cx: &mut Context<'_, _>| PdfReader::new(window, cx));
-                    cx.new(|cx| Root::new(main_ui.into(), window, cx))
+                    cx.new(|cx| Root::new(main_ui, window, cx))
                 },
             )
             .expect("Failed to build and open window");
         });
-    });
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen]
+pub fn start_gui() {
+    // Show dialog if app panics (otherwise just logs to console and silently stops working):
+    #[cfg(not(debug_assertions))] // <- easier hot reloads in debug builds
+    {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Log error to console:
+            previous(info);
+            // Then open an alert window so the user notices the issue:
+            if let Some(win) = web_sys::window() {
+                let _ = win.alert_with_message(&format!(
+                    "App panicked and will now stop working:\n{info}"
+                ));
+            }
+        }));
+    }
+
+    console_error_panic_hook::set_once();
+
+    // Initialize logging to browser console
+    console_log::init_with_level(log::Level::Info).expect("Failed to initialize logger");
+
+    // Also initialize tracing for WASM
+    tracing_wasm::set_as_global_default();
+
+    let document = web_sys::window()
+        .expect("No window")
+        .document()
+        .expect("No document");
+
+    gpui_platform::web_init();
+
+    gpui_platform::single_threaded_web()
+        .with_assets(gpui_component_assets::Assets::new(
+            if cfg!(debug_assertions) {
+                "http://127.0.0.1:8080/"
+            } else {
+                "https://lej77.github.io/pdf-reader-gpui/"
+            },
+        ))
+        .run(move |cx| {
+            // Remove the loading text and spinner:
+            if let Some(loading_text) = document.get_element_by_id("loading") {
+                loading_text.remove();
+            }
+
+            // This must be called before using any GPUI Component features.
+            gpui_component::init(cx);
+
+            cx.open_window(
+                WindowOptions::default(),
+                |window: &mut Window, cx: &mut App| {
+                    // Uncomment next line to test a specific theme instead of using the system theme:
+                    // gpui_component::Theme::change(gpui_component::ThemeMode::Light, Some(window), cx);
+
+                    let main_ui = cx.new(|cx: &mut Context<'_, _>| PdfReader::new(window, cx));
+                    cx.new(|cx| Root::new(main_ui, window, cx))
+                },
+            )
+            .expect("Failed to build and open window");
+        });
 }

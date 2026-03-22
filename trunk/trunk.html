@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPUI PDF Reader</title>
+    <link data-trunk rel="copy-dir" data-target-path="assets" href="../assets/">
+    <base data-trunk-public-url />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            overflow: hidden;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+        }
+
+        .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #000;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .error {
+            color: #d32f2f;
+            padding: 20px;
+            text-align: center;
+        }
+    </style>
+</head>
+
+<!--
+Info about running GPUI on the Web:
+https://github.com/longbridge/gpui-component/tree/311c7e0d104d817ed1ac9a1c7542d508df32f7cf/crates/story-web
+-->
+
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <p>Loading GPUI PDF Reader...</p>
+    </div>
+    <link data-trunk rel="rust" data-wasm-opt="z" href="../Cargo.toml" />
+</body>
+
+</html>

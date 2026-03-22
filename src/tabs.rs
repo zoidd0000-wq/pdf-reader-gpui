@@ -12,7 +12,11 @@ use std::cmp::Ordering;
 use std::ops::Sub;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 #[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
 #[action(namespace = tabs)]
@@ -150,7 +154,7 @@ impl SmoothScrollState {
         _cx: &mut Context<T>,
         scroll_handle: &ScrollHandle,
     ) {
-        let current_offset = Self::bound_scroll(&scroll_handle, scroll_handle.offset());
+        let current_offset = Self::bound_scroll(scroll_handle, scroll_handle.offset());
 
         if self.last_set_offset != current_offset {
             self.start_offset = self.wanted_offset();
@@ -252,6 +256,11 @@ impl SmoothScrollState {
 
             cx.notify();
         }
+    }
+}
+impl Default for SmoothScrollState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -423,7 +432,7 @@ impl<T: TabData> Render for TabsView<T> {
                 .into_any_element()
         };
         let tab_bar = TabBar::new("dynamic-tabs-with-pdf-files")
-            .with_menu(self.tabs.len() > 1)
+            .menu(self.tabs.len() > 1)
             .selected_index(self.active_tab)
             .track_scroll(&self.scroll_handle)
             .on_click(cx.listener(|view, index, window, cx| {
@@ -436,7 +445,8 @@ impl<T: TabData> Render for TabsView<T> {
                 } else {
                     "New tab".into()
                 };
-                Tab::new(label.clone())
+                Tab::new()
+                    .label(label.clone())
                     .rounded(cx.theme().radius)
                     .on_drag(
                         DragTab {

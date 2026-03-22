@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=.Trunk.schema.json
+# Generate the schema using `trunk config generate-schema .Trunk.schema.json`, see https://trunkrs.dev/guide/configuration/schema.html
+"$schema": ".Trunk.schema.json"
+"build":
+    # The index HTML file to drive the bundling process.
+    "target": "./trunk.html"
+    # The output dir for all final assets.
+    "dist": "dist"
+    # How to prefix paths to assets: https://trunkrs.dev/guide/advanced/paths.html
+    "public_url": ./
+
+"watch":
+    "ignore": ["./.Trunk.schema.json"]
+    "watch": ["../src", "../Cargo.toml", "../build.rs"]
+
+"serve":
+    "addresses": ["127.0.0.1"]
+    "port": 8080
+    "open": false
+
+"tools":
+    # Default wasm-bindgen version to download.
+    # This is the "wasm-bindgen-cli" crate: https://crates.io/crates/wasm-bindgen-cli
+    "wasm_bindgen": "0.2.114"
+    # Default wasm-opt version to download.
+    # Find latest at: https://github.com/WebAssembly/binaryen/releases
+    "wasm_opt": "version_128"

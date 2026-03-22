@@ -7,8 +7,10 @@ The GUI is implemented using [`gpui`](https://www.gpui.rs/): "A fast, productive
 ## Usage
 
 - Build a release version locally using `cargo build --release` then run `target/release/pdf-reader-gpui.exe`.
+  - When developing use `cargo run` instead
 - Or download a precompiled executable from the [latest GitHub release](https://github.com/Lej77/pdf-reader-gpui/releases).
-- When developing use: `cargo run`
+- Build as website using [trunk](https://trunkrs.dev/) (`cd trunk` then `trunk serve` or `trunk build --release`).
+  - You can try the current web demo at: <https://lej77.github.io/pdf-reader-gpui/>
 
 ### `cargo install`
 
