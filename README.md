@@ -1,6 +1,6 @@
 # pdf-reader-gpui
 
-This is a GUI program that renders PDF files.
+This is an experimental GUI program that renders PDF files.
 
 The GUI is implemented using [`gpui`](https://www.gpui.rs/): "A fast, productive UI framework for Rust from the creators of Zed".
 
