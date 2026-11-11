@@ -12,25 +12,28 @@ pub mod assets;
 pub mod elm;
 pub mod pdf;
 pub mod prompt;
+pub mod session;
 pub mod tabs;
 
 use crate::elm::{MsgSender, Update};
 use crate::prompt::{NoDisplayHandle, prompt_load_pdf_file};
 use crate::tabs::TabsView;
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, AsyncWindowContext, Context, Entity, FocusHandle, ImageCacheError,
-    ImageSource, InteractiveElement, IntoElement, KeyBinding, ObjectFit, ParentElement, Pixels,
-    Render, RenderImage, Resource, ScrollHandle, SharedString, Size, Styled, StyledImage, Task,
-    WeakEntity, Window, WindowOptions, div, img, px, size,
+    App, AppContext, AsyncWindowContext, Bounds, ClipboardItem, Context, Entity, FocusHandle,
+    ImageCacheError, ImageSource, InteractiveElement, IntoElement, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render,
+    RenderImage, Resource, ScrollHandle, SharedString, Size, Styled, StyledImage, Task,
+    WeakEntity, Window, WindowOptions, canvas, div, hsla, img, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::Scrollbar;
-use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
+use gpui_component::{Root, StyledExt, VirtualListScrollHandle, h_flex, v_flex, v_virtual_list};
 use hayro::RenderSettings;
 use hayro_interpret::InterpreterSettings;
 use hayro_syntax::Pdf;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -48,18 +51,29 @@ use wasm_bindgen::prelude::*;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// This type is the same as [`RenderSettings`] except it implements more traits.
+const SNIP_SCALE: f32 = 2.0;
+
+#[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
+#[action(namespace = pdf_reader)]
+pub struct ZoomIn;
+
+#[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
+#[action(namespace = pdf_reader)]
+pub struct ZoomOut;
+
+#[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
+#[action(namespace = pdf_reader)]
+pub struct ZoomReset;
+
+#[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
+#[action(namespace = pdf_reader)]
+pub struct ToggleSnip;
+
 #[derive(Clone, Copy, PartialEq)]
 pub struct RenderSettings2 {
-    /// How much the contents should be scaled into the x direction.
     pub x_scale: f32,
-    /// How much the contents should be scaled into the y direction.
     pub y_scale: f32,
-    /// The width of the viewport. If this is set to `None`, the width will be chosen
-    /// automatically based on the scale factor and the dimensions of the PDF.
     pub width: Option<u16>,
-    /// The height of the viewport. If this is set to `None`, the height will be chosen
-    /// automatically based on the scale factor and the dimensions of the PDF.
     pub height: Option<u16>,
 }
 impl Default for RenderSettings2 {
@@ -94,11 +108,9 @@ impl From<RenderSettings2> for RenderSettings {
     }
 }
 
-/// `true` if both ranges overlap or share an edge.
 pub fn range_is_contiguous(a: Range<usize>, b: Range<usize>) -> bool {
     range_union(a.clone(), b.clone()).len() <= a.len() + b.len()
 }
-/// Get the smallest range that contains both `a` and `b`.
 pub fn range_union(a: Range<usize>, b: Range<usize>) -> Range<usize> {
     match (a.len(), b.len()) {
         (0, 0) => 0..0,
@@ -107,7 +119,6 @@ pub fn range_union(a: Range<usize>, b: Range<usize>) -> Range<usize> {
         _ => a.start.min(b.start)..a.end.max(b.end),
     }
 }
-/// Get the largest range that is covered by both `a` and `b`.
 pub fn range_intersection(a: Range<usize>, b: Range<usize>) -> Range<usize> {
     let start = a.start.max(b.start);
     start..a.end.min(b.end).max(start)
@@ -224,25 +235,17 @@ macro_rules! future_on_wasm {
 }
 
 struct PdfPageCacheMutableState {
-    /// Currently cached images of PDF pages. Index of an image is the PDF page's index.
     images: Vec<Option<Arc<RenderImage>>>,
-    /// Settings (zoom) that will be used when rendering images.
     render_settings: RenderSettings2,
-    /// The parsed PDF file that the background thread will rasterize.
     pdf: Option<Arc<Pdf>>,
-    /// Notify/wake the foreground future so that it can request a re-render of the UI with newly
-    /// cached images.
     wake_future: Option<Waker>,
-    /// All pages in the range should eventually be cached.
     requested_pages: Range<usize>,
-    /// The background thread has acknowledged that pages in this range will be rendered.
     acknowledged_pages: Range<usize>,
-    /// If `true` then background worker thread and foreground task will exit.
     should_quit: bool,
 }
 impl PdfPageCacheMutableState {
     pub fn set_new_pdf(&mut self, pdf: Option<Arc<Pdf>>, render_settings: RenderSettings2) {
-        self.images.clear(); // <- always clear to ensure all items are None.
+        self.images.clear();
         if let Some(pdf) = pdf.as_ref() {
             self.images.resize_with(pdf.pages().len(), || None);
         }
@@ -260,13 +263,9 @@ struct PdfPageCacheSharedState {
     wake_worker: AsyncCondvar,
 }
 struct PdfPageCache {
-    /// Data shared between background worker thread, frontend async task and [`PdfPages`] view.
     shared: Arc<PdfPageCacheSharedState>,
-    /// Dropping this will stop the foreground task.
     _ui_updater: Task<()>,
-    /// PDF pages rendered this frame.
     pages_this_frame: Range<usize>,
-    /// PDF pages rendered previous frame (keep this in cache).
     pages_last_frame: Range<usize>,
     rendered_images: HashSet<ArcIdentity<RenderImage>>,
 }
@@ -330,8 +329,6 @@ impl PdfPageCache {
         this
     }
 
-    /// Notify [`PdfPages`] view when new PDF pages have been rendered by the worker thread running
-    /// [`Self::background_work`].
     async fn foreground_work(
         shared: Arc<PdfPageCacheSharedState>,
         parent: WeakEntity<PdfPages>,
@@ -368,7 +365,6 @@ impl PdfPageCache {
             }
         }
 
-        // array of bools (true if an image is known to be cached)
         let mut rendered_images = Vec::with_capacity(256);
         loop {
             let should_quit = WaitForChange {
@@ -385,14 +381,11 @@ impl PdfPageCache {
                 cx.notify();
             });
             if result.is_err() {
-                // parent view dropped
                 return;
             }
         }
     }
 
-    /// Executed by dedicated worker thread that will rasterize PDF pages as requested by the
-    /// [`Self::get_images`] method.
     fn background_work(shared: Arc<PdfPageCacheSharedState>) -> future_on_wasm!(()) {
         async_on_wasm!({
             #[cfg_attr(not(target_family = "wasm"), expect(clippy::never_loop, unused_labels))]
@@ -404,20 +397,16 @@ impl PdfPageCache {
                             return;
                         }
 
-                        // Check if we need to rasterize another page:
                         let mut index_to_render = None;
                         {
                             let mut wanted_pages = guard.requested_pages.clone();
 
-                            // more aggressively cache earlier pages since the virtual list doesn't:
                             wanted_pages.start = wanted_pages.start.saturating_sub(1);
 
-                            // Chose the page closest to the center of the requested range:
                             let mut chose_index_distance = usize::MAX;
                             let center =
                                 wanted_pages.end.saturating_sub(1 + wanted_pages.len() / 2);
 
-                            // We special case caching of the first page since the virtual list always requests it
                             let cache_first_image = guard.requested_pages.start <= 1;
 
                             for (index, image) in guard.images.iter_mut().enumerate() {
@@ -446,13 +435,11 @@ impl PdfPageCache {
                         guard.acknowledged_pages = guard.requested_pages.clone();
 
                         if let Some(index) = index_to_render {
-                            // Copy render inputs:
                             let Some(pdf) = guard.pdf.clone() else {
                                 continue;
                             };
                             let render_settings = guard.render_settings;
 
-                            // render while not holding the lock:
                             drop(guard);
                             let new_image = pdf::rasterize_pdf_page(
                                 &pdf.pages()[index],
@@ -460,7 +447,6 @@ impl PdfPageCache {
                                 &RenderSettings::from(render_settings),
                             );
 
-                            // re-acquire lock and save new image to shared state:
                             guard = shared.state.lock().unwrap();
                             if guard.render_settings == render_settings
                                 && guard
@@ -484,7 +470,6 @@ impl PdfPageCache {
 
                         #[cfg(not(target_family = "wasm"))]
                         {
-                            // Nothing more to render (ensure range is correct and then wait):
                             guard = shared
                                 .wake_worker
                                 .wait_while(guard, |state| {
@@ -496,7 +481,7 @@ impl PdfPageCache {
 
                         #[cfg(target_family = "wasm")]
                         {
-                            break; // If async then need to wait while not holding mutex guard
+                            break;
                         }
                     }
                 };
@@ -504,9 +489,7 @@ impl PdfPageCache {
                 #[cfg(not(target_family = "wasm"))]
                 #[expect(unreachable_code)]
                 {
-                    match _loop_result {
-                        // Empty type, i.e. unreachable
-                    }
+                    match _loop_result {}
                 }
 
                 #[cfg(target_family = "wasm")]
@@ -571,23 +554,18 @@ impl PdfPageCache {
         );
 
         if visible_range.start == 0 && visible_range.end == 1 {
-            // Don't track request for only the first page since the virtual list always requests it.
             return images;
         }
 
         if self.pages_this_frame.is_empty()
             || !range_is_contiguous(self.pages_this_frame.clone(), visible_range.clone())
         {
-            // If non-contiguous: ignore previous range this frame, it was likely rendered
-            // incorrectly before layout calculations determined that they weren't visible
             self.pages_this_frame = visible_range.clone();
         } else {
-            // Keep previously rendered pages cached.
             self.pages_this_frame =
                 range_union(self.pages_this_frame.clone(), visible_range.clone());
         }
 
-        // Tell the background thread about the new image range:
         guard.requested_pages =
             range_union(self.pages_this_frame.clone(), self.pages_last_frame.clone());
 
@@ -612,16 +590,15 @@ impl PdfPageCache {
 }
 
 pub struct PdfPages {
-    /// Current scroll position.
     scroll_handle: VirtualListScrollHandle,
-    /// Pointer to scroll info inside tab data. Use to save current scroll position before loading a new PDF.
     save_scroll: RefCell<VirtualListScrollHandle>,
-    /// Sizes of each page in the PDF file.
     item_sizes: Rc<Vec<Size<Pixels>>>,
-    /// Cached rasterized PDF pages.
     pdf_page_cache: PdfPageCache,
-    /// Used to bypass GPUI's inbuilt image cache.
     disabled_cache: Entity<NoGpuiImageCache>,
+    zoom: f32,
+    snipping: bool,
+    snip: Option<(usize, Point<Pixels>, Point<Pixels>)>,
+    page_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
 }
 impl PdfPages {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -632,7 +609,58 @@ impl PdfPages {
             item_sizes: Rc::new(vec![]),
             pdf_page_cache: PdfPageCache::new(window, cx),
             disabled_cache: cx.new(|_cx| NoGpuiImageCache),
+            zoom: 1.0,
+            snipping: false,
+            snip: None,
+            page_bounds: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+
+    fn finish_snip(&mut self, cx: &mut Context<Self>) {
+        let Some((index, a, b)) = self.snip.take() else {
+            return;
+        };
+        self.snipping = false;
+        cx.notify();
+        let Some(bounds) = self.page_bounds.borrow().get(&index).copied() else {
+            return;
+        };
+        let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        if w <= 0. || h <= 0. {
+            return;
+        }
+        let rel = |p: Pixels, o: Pixels, s: f32| (f32::from(p - o) / s).clamp(0., 1.);
+        let x0 = rel(a.x.min(b.x), bounds.origin.x, w);
+        let x1 = rel(a.x.max(b.x), bounds.origin.x, w);
+        let y0 = rel(a.y.min(b.y), bounds.origin.y, h);
+        let y1 = rel(a.y.max(b.y), bounds.origin.y, h);
+        if x1 - x0 < 0.01 || y1 - y0 < 0.01 {
+            return;
+        }
+        let (pdf, mut settings) = {
+            let guard = self.pdf_page_cache.shared.state.lock().unwrap();
+            (guard.pdf.clone(), guard.render_settings)
+        };
+        let Some(pdf) = pdf else {
+            return;
+        };
+        if index >= pdf.pages().len() {
+            return;
+        }
+        settings.x_scale *= SNIP_SCALE;
+        settings.y_scale *= SNIP_SCALE;
+        let Some(png) = pdf::crop_page_png(
+            &pdf.pages()[index],
+            &InterpreterSettings::default(),
+            &RenderSettings::from(settings),
+            [x0, y0, x1, y1],
+        ) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            png,
+        )));
     }
 }
 impl Render for PdfPages {
@@ -654,22 +682,98 @@ impl Render for PdfPages {
                     "pdf-viewer-pages-list",
                     self.item_sizes.clone(),
                     move |view, visible_range, window, cx| {
+                        let snipping = view.snipping;
+                        let zoom = view.zoom;
+                        let selection = view.snip;
+                        let page_bounds = view.page_bounds.clone();
+                        let viewport_width = window.viewport_size().width;
                         visible_range
                             .clone()
                             .zip(view.pdf_page_cache.get_images(visible_range, window, cx))
-                            .map(|(_row_ix, page_image)| {
-                                if let Some(page_image) = page_image {
+                            .map(|(row_ix, page_image)| {
+                                let page = if let Some(page_image) = page_image {
                                     img(weak_image(&page_image))
                                         .object_fit(ObjectFit::Cover)
-                                        .max_w(window.viewport_size().width)
+                                        .when(zoom <= 1., |image| image.max_w(viewport_width))
                                         .image_cache(&view.disabled_cache)
-                                        //.w(px(page.media_box().width() as f32))
-                                        //.h(px(page.media_box().height() as f32))
                                         .into_any_element()
                                 } else {
-                                    //  Loading or errored
                                     div().into_any_element()
-                                }
+                                };
+                                div()
+                                    .relative()
+                                    .size_full()
+                                    .child(page)
+                                    .when(snipping, |item| {
+                                        let bounds_sink = page_bounds.clone();
+                                        let origin = page_bounds
+                                            .borrow()
+                                            .get(&row_ix)
+                                            .map(|bounds| bounds.origin)
+                                            .unwrap_or_default();
+                                        item.cursor_crosshair()
+                                            .child(
+                                                canvas(
+                                                    move |bounds, _, _| {
+                                                        bounds_sink.borrow_mut().insert(row_ix, bounds);
+                                                    },
+                                                    |_, _, _, _| {},
+                                                )
+                                                .absolute()
+                                                .size_full(),
+                                            )
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |view, event: &MouseDownEvent, _window, cx| {
+                                                        view.snip =
+                                                            Some((row_ix, event.position, event.position));
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
+                                            .on_mouse_move(cx.listener(
+                                                move |view, event: &MouseMoveEvent, _window, cx| {
+                                                    if let Some((index, start, _)) = view.snip
+                                                        && index == row_ix
+                                                    {
+                                                        view.snip = Some((index, start, event.position));
+                                                        cx.notify();
+                                                    }
+                                                },
+                                            ))
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|view, _: &MouseUpEvent, _window, cx| {
+                                                    view.finish_snip(cx);
+                                                }),
+                                            )
+                                            .on_mouse_up_out(
+                                                MouseButton::Left,
+                                                cx.listener(|view, _: &MouseUpEvent, _window, cx| {
+                                                    view.finish_snip(cx);
+                                                }),
+                                            )
+                                            .when_some(
+                                                selection.filter(|selected| selected.0 == row_ix),
+                                                |item, (_, a, b)| {
+                                                    let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+                                                    let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+                                                    item.child(
+                                                        div()
+                                                            .absolute()
+                                                            .left(x0 - origin.x)
+                                                            .top(y0 - origin.y)
+                                                            .w(x1 - x0)
+                                                            .h(y1 - y0)
+                                                            .border_1()
+                                                            .border_color(hsla(0.6, 0.9, 0.6, 1.))
+                                                            .bg(hsla(0.6, 0.9, 0.6, 0.2)),
+                                                    )
+                                                },
+                                            )
+                                    })
+                                    .into_any_element()
                             })
                             .collect()
                     },
@@ -677,7 +781,6 @@ impl Render for PdfPages {
                 .track_scroll(&self.scroll_handle),
             )
             .child(
-                // Add scrollbars
                 div()
                     .absolute()
                     .top_0()
@@ -703,8 +806,23 @@ impl PdfReader {
             KeyBinding::new("ctrl-t", tabs::CreateTab, Some(CONTEXT)),
             KeyBinding::new("ctrl-tab", tabs::NextTab, Some(CONTEXT)),
             KeyBinding::new("ctrl-shift-tab", tabs::PrevTab, Some(CONTEXT)),
+            KeyBinding::new("ctrl-=", ZoomIn, Some(CONTEXT)),
+            KeyBinding::new("ctrl--", ZoomOut, Some(CONTEXT)),
+            KeyBinding::new("ctrl-0", ZoomReset, Some(CONTEXT)),
+            KeyBinding::new("ctrl-shift-s", ToggleSnip, Some(CONTEXT)),
         ]);
-        // dbg!(&cx.key_bindings().borrow().bindings().collect::<Vec<_>>());
+
+        let restored: Vec<PdfTabData> = session::load()
+            .into_iter()
+            .filter_map(|path| {
+                let data = std::fs::read(&path).ok()?;
+                Some(PdfTabData {
+                    path: Arc::new(path),
+                    pdf_data: Arc::new(data),
+                    scroll: RefCell::new(VirtualListScrollHandle::from(ScrollHandle::new())),
+                })
+            })
+            .collect();
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -719,6 +837,14 @@ impl PdfReader {
                             })
                             .detach();
                     });
+                    let mut restored = restored.into_iter();
+                    if let Some(first) = restored.next() {
+                        tabs.tabs_data_mut()[0] = Some(first);
+                        for data in restored {
+                            tabs.create_tab(Some(data), window, cx);
+                        }
+                        tabs.set_active_tab(0, window, cx);
+                    }
                     tabs
                 })
             },
@@ -727,30 +853,60 @@ impl PdfReader {
         }
     }
 
+    fn save_session(&self, cx: &App) {
+        let paths: Vec<PathBuf> = self
+            .tabs
+            .read(cx)
+            .tabs_data()
+            .iter()
+            .flatten()
+            .map(|tab| tab.path.as_ref().clone())
+            .collect();
+        session::save(&paths);
+    }
+
+    fn zoom_by(&mut self, factor: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.pages.update(cx, |pages, _| {
+            pages.zoom = (pages.zoom * factor).clamp(0.25, 4.);
+        });
+        self.active_pdf_changed(window, cx);
+    }
+
+    fn zoom_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pages.update(cx, |pages, _| pages.zoom = 1.);
+        self.active_pdf_changed(window, cx);
+    }
+
+    fn toggle_snip(&mut self, cx: &mut Context<Self>) {
+        self.pages.update(cx, |pages, cx| {
+            pages.snipping = !pages.snipping;
+            pages.snip = None;
+            cx.notify();
+        });
+    }
+
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn active_pdf_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pages.update(cx, |pages, cx| {
-            pages.item_sizes = Rc::new(vec![]); // forget page sizes
-            pages.pdf_page_cache.clear(); // clear cache
+            pages.item_sizes = Rc::new(vec![]);
+            pages.pdf_page_cache.clear();
 
-            *pages.save_scroll.borrow_mut() = pages.scroll_handle.clone(); // save scroll
-            pages.scroll_handle = VirtualListScrollHandle::from(ScrollHandle::default()); // reset scroll
+            *pages.save_scroll.borrow_mut() = pages.scroll_handle.clone();
+            pages.scroll_handle = VirtualListScrollHandle::from(ScrollHandle::default());
 
             let Some(tab_data) = self.tabs.read(cx).active_tab_data() else {
                 return;
             };
-            pages.scroll_handle = tab_data.scroll.borrow().clone(); // restore scroll
+            pages.scroll_handle = tab_data.scroll.borrow().clone();
             let Ok(pdf) = Pdf::new(tab_data.pdf_data.clone()) else {
                 return;
             };
             let pdf: Arc<Pdf> = Arc::new(pdf);
             if pdf.pages().is_empty() {
-                // no pages
                 return;
             }
             let viewport_size = window.viewport_size();
 
-            // Scale to fit window width:
             let max_width = pdf
                 .pages()
                 .iter()
@@ -758,7 +914,7 @@ impl PdfReader {
                 .max_by(f32::total_cmp)
                 .expect("there should be at least one page");
             let viewport_width = f32::from(viewport_size.width);
-            let scale = viewport_width / max_width;
+            let scale = viewport_width / max_width * pages.zoom;
 
             let render_settings = RenderSettings {
                 x_scale: scale,
@@ -766,18 +922,15 @@ impl PdfReader {
                 ..Default::default()
             };
 
-            // Update image rendering:
             pages
                 .pdf_page_cache
                 .set_new_pdf(Some(pdf.clone()), render_settings.into());
 
-            // Update layout/sizes:
             self.assumed_viewport_size = viewport_size;
             pages.item_sizes = Rc::new(
                 pdf.pages()
                     .iter()
                     .map(|page| {
-                        // Code adapted from `hayro::render`:
                         let (width, height) = page.render_dimensions();
                         let (width, height) = (width * scale, height * scale);
 
@@ -790,10 +943,10 @@ impl PdfReader {
     fn check_window_size(&mut self, window: &Window, cx: &mut Context<Self>) {
         let mut latest_window_size = window.viewport_size();
         if self.assumed_viewport_size == Size::default() {
-            return; // resize already being monitored.
+            return;
         }
         if latest_window_size == self.assumed_viewport_size {
-            return; // no resize
+            return;
         }
         self.assumed_viewport_size = Size::default();
         let this = cx.weak_entity();
@@ -808,7 +961,6 @@ impl PdfReader {
                     let keep_checking = window.update(|window, cx| {
                         let new_size = window.viewport_size();
                         if new_size != latest_window_size {
-                            // still resizing
                             latest_window_size = new_size;
                             true
                         } else {
@@ -830,6 +982,7 @@ const CONTEXT: &str = "pdf-reader";
 impl Render for PdfReader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.check_window_size(window, cx);
+        let zoom = self.pages.read(cx).zoom;
         v_flex()
             .size_full()
             .id("pdf-reader")
@@ -839,9 +992,34 @@ impl Render for PdfReader {
             .on_action(window.listener_for(&self.tabs, TabsView::on_action_create_tab))
             .on_action(window.listener_for(&self.tabs, TabsView::on_action_next_tab))
             .on_action(window.listener_for(&self.tabs, TabsView::on_action_prev_tab))
-            // Tab bar:
+            .on_action(cx.listener(|this, _: &ZoomIn, window, cx| this.zoom_by(1.25, window, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, window, cx| this.zoom_by(0.8, window, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, window, cx| this.zoom_reset(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSnip, _window, cx| this.toggle_snip(cx)))
             .child(self.tabs.clone())
-            // Content:
+            .child(
+                h_flex()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .items_center()
+                    .child(
+                        Button::new("zoom-out")
+                            .label("-")
+                            .on_click(cx.listener(|this, _, window, cx| this.zoom_by(0.8, window, cx))),
+                    )
+                    .child(format!("{}%", (zoom * 100.).round() as u32))
+                    .child(
+                        Button::new("zoom-in")
+                            .label("+")
+                            .on_click(cx.listener(|this, _, window, cx| this.zoom_by(1.25, window, cx))),
+                    )
+                    .child(
+                        Button::new("snip")
+                            .label("Snip")
+                            .on_click(cx.listener(|this, _, _window, cx| this.toggle_snip(cx))),
+                    ),
+            )
             .child(
                 if let Some(tab_data) = self.tabs.read(cx).active_tab_data() {
                     match Pdf::new(tab_data.pdf_data.clone()) {
@@ -907,9 +1085,11 @@ impl Update<PdfCommand> for PdfReader {
                     });
                 }
                 self.active_pdf_changed(window, cx);
+                self.save_session(cx);
             }
             PdfCommand::ChangedTab => {
                 self.active_pdf_changed(window, cx);
+                self.save_session(cx);
             }
         }
     }
@@ -924,15 +1104,11 @@ pub fn start_gui() {
             unsafe { std::env::set_var("RUST_LOG", "trace") };
         }
     }
-    env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
-
-    // let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-    // let _rt_guard = rt.enter();
+    env_logger::init();
 
     gpui::Application::new()
         .with_assets(crate::assets::Assets)
         .run(|cx: &mut App| {
-            // This must be called before using any GPUI Component features.
             gpui_component::init(cx);
 
             cx.open_window(
@@ -945,9 +1121,6 @@ pub fn start_gui() {
                     ..Default::default()
                 },
                 |window: &mut Window, cx: &mut App| {
-                    // Uncomment next line to test a specific theme instead of using the system theme:
-                    // gpui_component::Theme::change(gpui_component::ThemeMode::Light, Some(window), cx);
-
                     let main_ui = cx.new(|cx: &mut Context<'_, _>| PdfReader::new(window, cx));
                     cx.new(|cx| Root::new(main_ui, window, cx))
                 },
@@ -959,14 +1132,11 @@ pub fn start_gui() {
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 pub fn start_gui() {
-    // Show dialog if app panics (otherwise just logs to console and silently stops working):
-    #[cfg(not(debug_assertions))] // <- easier hot reloads in debug builds
+    #[cfg(not(debug_assertions))]
     {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            // Log error to console:
             previous(info);
-            // Then open an alert window so the user notices the issue:
             if let Some(win) = web_sys::window() {
                 let _ = win.alert_with_message(&format!(
                     "App panicked and will now stop working:\n{info}"
@@ -977,10 +1147,8 @@ pub fn start_gui() {
 
     console_error_panic_hook::set_once();
 
-    // Initialize logging to browser console
     console_log::init_with_level(log::Level::Info).expect("Failed to initialize logger");
 
-    // Also initialize tracing for WASM
     tracing_wasm::set_as_global_default();
 
     let document = web_sys::window()
@@ -999,20 +1167,15 @@ pub fn start_gui() {
             },
         ))
         .run(move |cx| {
-            // Remove the loading text and spinner:
             if let Some(loading_text) = document.get_element_by_id("loading") {
                 loading_text.remove();
             }
 
-            // This must be called before using any GPUI Component features.
             gpui_component::init(cx);
 
             cx.open_window(
                 WindowOptions::default(),
                 |window: &mut Window, cx: &mut App| {
-                    // Uncomment next line to test a specific theme instead of using the system theme:
-                    // gpui_component::Theme::change(gpui_component::ThemeMode::Light, Some(window), cx);
-
                     let main_ui = cx.new(|cx: &mut Context<'_, _>| PdfReader::new(window, cx));
                     cx.new(|cx| Root::new(main_ui, window, cx))
                 },
