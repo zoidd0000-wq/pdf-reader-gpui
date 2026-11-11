@@ -17,7 +17,6 @@ use std::fmt;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-/// Rasterize a PDF page and convert the result from a [`hayro::Pixmap`] to a [`gpui::RenderImage`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn rasterize_pdf_page(
     page: &Page,
@@ -25,23 +24,39 @@ pub fn rasterize_pdf_page(
     render_settings: &RenderSettings,
 ) -> Arc<RenderImage> {
     let pixmap = render(page, interpreter_settings, render_settings);
-    // extract_features(page, interpreter_settings, render_settings, &mut |feature| eprintln!("{feature:?}"));
     Arc::new(pixmap_to_gpui_image(pixmap))
 }
 
-/// Convert a rendered PDF in the form of a [`Pixmap`] into a GPUI [`RenderImage`]. This conversion
-/// doesn't allocate but does need to traverse the whole image data buffer to convert colors from
-/// `RGBA` to `BGRA`.
-pub fn pixmap_to_gpui_image(pixmap: Pixmap) -> RenderImage {
-    // The code below that converts to RenderImage was inspired by code from:
-    // <gpui::ImageDecoder as Asset>::load
-    //
-    // The more "normal" way to convert it would be using:
-    // Image::from_bytes(ImageFormat::Png, pixmap.take_png()).to_image_data(renderer)
-
+pub fn crop_page_png(
+    page: &Page,
+    interpreter_settings: &InterpreterSettings,
+    render_settings: &RenderSettings,
+    region: [f32; 4],
+) -> Option<Vec<u8>> {
+    let pixmap = render(page, interpreter_settings, render_settings);
     let width = u32::from(pixmap.width());
     let height = u32::from(pixmap.height());
-    // Convert from RGBA to BGRA.
+    let data: Vec<u8> = pixmap
+        .take()
+        .into_iter()
+        .flat_map(|rgba| [rgba.r, rgba.g, rgba.b, rgba.a])
+        .collect();
+    let full = RgbaImage::from_raw(width, height, data)?;
+    let x = ((region[0] * width as f32) as u32).min(width - 1);
+    let y = ((region[1] * height as f32) as u32).min(height - 1);
+    let w = (((region[2] - region[0]) * width as f32) as u32).clamp(1, width - x);
+    let h = (((region[3] - region[1]) * height as f32) as u32).clamp(1, height - y);
+    let cropped = image::imageops::crop_imm(&full, x, y, w, h).to_image();
+    let mut out = Vec::new();
+    cropped
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
+pub fn pixmap_to_gpui_image(pixmap: Pixmap) -> RenderImage {
+    let width = u32::from(pixmap.width());
+    let height = u32::from(pixmap.height());
     let data: Vec<u8> = pixmap
         .take()
         .into_iter()
@@ -71,11 +86,7 @@ impl fmt::Debug for PdfFeature<'_> {
         match self {
             PdfFeature::Text { text, rect } => f
                 .debug_struct("PdfFeature::Text")
-                .field(
-                    "text",
-                    //&String::from_utf16_lossy(&text.chunks_exact(2).map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>()),
-                    &String::from_utf8_lossy(&text),
-                )
+                .field("text", &String::from_utf8_lossy(&text))
                 .field("rect", rect)
                 .finish(),
         }
@@ -89,8 +100,6 @@ pub fn extract_features(
     render_settings: &RenderSettings,
     handle_feature: &mut dyn FnMut(PdfFeature<'_>),
 ) {
-    // Adapted from `hayro::render` but the device was changed to `FeatureExtractor` and some rendering code was removed.
-
     let (x_scale, y_scale) = (render_settings.x_scale, render_settings.y_scale);
     let (width, height) = page.render_dimensions();
     let (scaled_width, scaled_height) = ((width * x_scale) as f64, (height * y_scale) as f64);
@@ -162,7 +171,6 @@ pub fn extract_features(
                     ),
                 }
 
-                // log::trace!("{rect:?} --- {:?} --- {op:?}", String::from_utf8_lossy(&data));
                 handle_feature(PdfFeature::Text {
                     rect,
                     text: Cow::Borrowed(data.as_slice()),
@@ -184,11 +192,6 @@ struct FeatureExtractorState<'pdf> {
     text_region: Cell<Option<Rect>>,
 }
 
-/// A [`hayro_interpret::Device`] that is used as an "output" for PDF rendering.
-///
-/// See
-/// [`hayro-interpret/examples/extract_images.rs`](https://github.com/LaurenzV/hayro/blob/e08071f8602c3e28000b4d114be41d08ee82b86b/hayro-interpret/examples/extract_images.rs)
-/// for a simpler example.
 struct FeatureExtractor<'out, 'pdf> {
     shared: &'out FeatureExtractorState<'pdf>,
 }
@@ -222,10 +225,6 @@ impl<'a, 'out, 'pdf> Device<'a> for FeatureExtractor<'out, 'pdf> {
         _paint: &Paint<'a>,
         _draw_mode: &GlyphDrawMode,
     ) {
-        // Text rasterization is done at:
-        // https://github.com/LaurenzV/hayro/blob/e08071f8602c3e28000b4d114be41d08ee82b86b/hayro-interpret/src/interpret/text.rs#L11
-        // After each character in the string `apply_code_advance` is called:
-        // https://github.com/LaurenzV/hayro/blob/e08071f8602c3e28000b4d114be41d08ee82b86b/hayro-interpret/src/interpret/state.rs#L145
         let top_left = transform * glyph_transform * Point::new(0., 0.);
         let bottom_right = transform * glyph_transform * Point::new(1., 1.);
         let rect = Rect::from_points(top_left, bottom_right);
@@ -238,39 +237,11 @@ impl<'a, 'out, 'pdf> Device<'a> for FeatureExtractor<'out, 'pdf> {
             }));
     }
 
-    fn draw_image(&mut self, _image: Image<'a, '_>, _transform: Affine) {
-        // TODO: extract image (see example linked in struct's doc-comment above)
-    }
+    fn draw_image(&mut self, _image: Image<'a, '_>, _transform: Affine) {}
 
     fn pop_clip_path(&mut self) {}
 
     fn pop_transparency_group(&mut self) {}
 
     fn set_blend_mode(&mut self, _blend_mode: hayro_interpret::BlendMode) {}
-    pub fn crop_page_png(
-    page: &Page,
-    interpreter_settings: &InterpreterSettings,
-    render_settings: &RenderSettings,
-    region: [f32; 4],
-) -> Option<Vec<u8>> {
-    let pixmap = render(page, interpreter_settings, render_settings);
-    let width = u32::from(pixmap.width());
-    let height = u32::from(pixmap.height());
-    let data: Vec<u8> = pixmap
-        .take()
-        .into_iter()
-        .flat_map(|rgba| [rgba.r, rgba.g, rgba.b, rgba.a])
-        .collect();
-    let full = RgbaImage::from_raw(width, height, data)?;
-    let x = ((region[0] * width as f32) as u32).min(width - 1);
-    let y = ((region[1] * height as f32) as u32).min(height - 1);
-    let w = (((region[2] - region[0]) * width as f32) as u32).clamp(1, width - x);
-    let h = (((region[3] - region[1]) * height as f32) as u32).clamp(1, height - y);
-    let cropped = image::imageops::crop_imm(&full, x, y, w, h).to_image();
-    let mut out = Vec::new();
-    cropped
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-        .ok()?;
-    Some(out)
-}
 }
