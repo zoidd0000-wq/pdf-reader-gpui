@@ -247,4 +247,30 @@ impl<'a, 'out, 'pdf> Device<'a> for FeatureExtractor<'out, 'pdf> {
     fn pop_transparency_group(&mut self) {}
 
     fn set_blend_mode(&mut self, _blend_mode: hayro_interpret::BlendMode) {}
+    pub fn crop_page_png(
+    page: &Page,
+    interpreter_settings: &InterpreterSettings,
+    render_settings: &RenderSettings,
+    region: [f32; 4],
+) -> Option<Vec<u8>> {
+    let pixmap = render(page, interpreter_settings, render_settings);
+    let width = u32::from(pixmap.width());
+    let height = u32::from(pixmap.height());
+    let data: Vec<u8> = pixmap
+        .take()
+        .into_iter()
+        .flat_map(|rgba| [rgba.r, rgba.g, rgba.b, rgba.a])
+        .collect();
+    let full = RgbaImage::from_raw(width, height, data)?;
+    let x = ((region[0] * width as f32) as u32).min(width - 1);
+    let y = ((region[1] * height as f32) as u32).min(height - 1);
+    let w = (((region[2] - region[0]) * width as f32) as u32).clamp(1, width - x);
+    let h = (((region[3] - region[1]) * height as f32) as u32).clamp(1, height - y);
+    let cropped = image::imageops::crop_imm(&full, x, y, w, h).to_image();
+    let mut out = Vec::new();
+    cropped
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
 }
